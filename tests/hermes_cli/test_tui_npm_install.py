@@ -1,5 +1,6 @@
 """_tui_need_npm_install: auto npm when node_modules is behind the lockfile."""
 
+import json
 import os
 import types
 from pathlib import Path
@@ -26,10 +27,91 @@ def _touch_tui_entry(root: Path) -> None:
     entry.write_text("console.log('tui')")
 
 
+def _write_lock(path: Path, packages: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"packages": packages}), encoding="utf-8")
+
+
+def _workspace_lock_fixture(tmp_path: Path) -> tuple[Path, dict, dict]:
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}", encoding="utf-8")
+    _touch_ink(tmp_path)
+
+    wanted = {
+        "": {},
+        "ui-tui": {
+            "name": "hermes-tui",
+            "version": "0.0.1",
+            "dependencies": {"react": "1.0.0"},
+        },
+        "node_modules/react": {"version": "1.0.0"},
+        "web": {
+            "version": "0.0.0",
+            "dependencies": {"web-only": "1.0.0"},
+        },
+        "node_modules/web-only": {"version": "1.0.0"},
+    }
+    installed = {
+        "ui-tui": wanted["ui-tui"].copy(),
+        "node_modules/react": wanted["node_modules/react"].copy(),
+    }
+    _write_lock(tmp_path / "package-lock.json", wanted)
+    _write_lock(tmp_path / "node_modules" / ".package-lock.json", installed)
+    return tui_dir, wanted, installed
+
+
 def _assert_utf8_replace_capture(kwargs: dict) -> None:
     assert kwargs["text"] is True
     assert kwargs["encoding"] == "utf-8"
     assert kwargs["errors"] == "replace"
+
+
+def test_workspace_ignores_missing_unrelated_workspace_packages(
+    tmp_path: Path, main_mod
+) -> None:
+    tui_dir, _wanted, _installed = _workspace_lock_fixture(tmp_path)
+
+    assert main_mod._tui_need_npm_install(tui_dir) is False
+
+
+def test_workspace_detects_missing_relevant_dependency(
+    tmp_path: Path, main_mod
+) -> None:
+    tui_dir, _wanted, installed = _workspace_lock_fixture(tmp_path)
+    installed.pop("node_modules/react")
+    _write_lock(tmp_path / "node_modules" / ".package-lock.json", installed)
+
+    assert main_mod._tui_need_npm_install(tui_dir) is True
+
+
+def test_workspace_detects_relevant_version_drift_even_with_current_bundle(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    tui_dir, _wanted, installed = _workspace_lock_fixture(tmp_path)
+    installed["node_modules/react"]["version"] = "0.9.0"
+    _write_lock(tmp_path / "node_modules" / ".package-lock.json", installed)
+    _touch_tui_entry(tui_dir)
+    monkeypatch.setattr(main_mod, "_tui_need_rebuild", lambda _root: False)
+
+    assert main_mod._tui_need_npm_install(tui_dir) is True
+
+
+def test_standalone_layout_compares_full_lockfile(tmp_path: Path, main_mod) -> None:
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}", encoding="utf-8")
+    _touch_ink(tui_dir)
+    wanted = {
+        "": {},
+        "node_modules/react": {"version": "1.0.0"},
+        "node_modules/missing": {"version": "1.0.0"},
+    }
+    installed = {"node_modules/react": wanted["node_modules/react"].copy()}
+    _write_lock(tui_dir / "package-lock.json", wanted)
+    _write_lock(tui_dir / "node_modules" / ".package-lock.json", installed)
+
+    assert main_mod._tui_need_npm_install(tui_dir) is True
 
 
 
@@ -65,12 +147,12 @@ def test_make_tui_argv_uses_bundled_tui_when_workspace_missing(
     bundled_entry.write_text("// bundled TUI")
     monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: bundled_entry)
 
-    def which(name: str) -> str | None:
+    def find_node(name: str) -> str | None:
         if name == "node":
             return "/usr/bin/node"
         raise AssertionError(f"unexpected shutil.which({name!r}) call — bundled path must not need npm/git")
 
-    monkeypatch.setattr(main_mod.shutil, "which", which)
+    monkeypatch.setattr("hermes_constants.find_node_executable", find_node)
 
     def fail_run(*_args, **_kwargs):
         raise AssertionError("bundled TUI path must not spawn any subprocess (no npm install/build, no git restore)")
@@ -157,7 +239,9 @@ def test_make_tui_argv_omits_workspace_when_tui_has_own_lockfile(
     monkeypatch.delenv("TERMUX_VERSION", raising=False)
     monkeypatch.setenv("PREFIX", "/usr")
     monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
-    monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(
+        "hermes_constants.find_node_executable", lambda name: f"/bin/{name}"
+    )
     calls = []
 
     def fake_run(*args, **kwargs):

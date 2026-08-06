@@ -1606,6 +1606,13 @@ installed, so we exclude them from the comparison in :func:`_tui_need_npm_instal
 to avoid false-positive reinstalls on every launch.
 """
 
+_NPM_LOCK_DEP_FIELDS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+
 
 def _workspace_root(dir: Path) -> Path:
     """Return the npm workspace root for *dir*.
@@ -1660,6 +1667,58 @@ def _termux_workspace_install_context(
     return ws_root, tuple(workspace_args)
 
 
+def _workspace_scoped_lock_names(
+    workspace_dir: Path,
+    ws_root: Path,
+    wanted: dict,
+    installed: dict,
+) -> set[str] | None:
+    """Return lockfile package names relevant to one npm workspace.
+
+    ``npm install --workspace ui-tui`` writes a hidden lockfile for the
+    actualized workspace subset, while the root lockfile still describes
+    desktop, web, and every other workspace. For a workspace-scoped launch
+    check, missing packages outside the selected workspace are expected and
+    must not trigger a reinstall loop.
+    """
+    if ws_root == workspace_dir:
+        return None
+
+    try:
+        workspace_rel = workspace_dir.relative_to(ws_root).as_posix()
+    except ValueError:
+        return None
+
+    relevant: set[str] = set()
+    workspace_prefix = f"{workspace_rel}/"
+    for name, pkg in wanted.items():
+        if not isinstance(pkg, dict):
+            continue
+        if name == workspace_rel or name.startswith(workspace_prefix):
+            relevant.add(name)
+
+    queue = list(relevant)
+    while queue:
+        pkg = wanted.get(queue.pop(0))
+        if not isinstance(pkg, dict):
+            continue
+        for field in _NPM_LOCK_DEP_FIELDS:
+            deps = pkg.get(field)
+            if not isinstance(deps, dict):
+                continue
+            for dep_name in deps:
+                dep_key = f"node_modules/{dep_name}"
+                if dep_key in wanted and dep_key not in relevant:
+                    relevant.add(dep_key)
+                    queue.append(dep_key)
+
+    # If npm did install a package, compare it even if the simple dependency
+    # walk above missed the exact lockfile path. This catches version skew
+    # without requiring unrelated workspaces to be present.
+    relevant.update(name for name in installed if name in wanted)
+    return relevant
+
+
 def _tui_need_npm_install(root: Path) -> bool:
     """True when @hermes/ink is missing or node_modules is behind package-lock.json.
 
@@ -1672,7 +1731,10 @@ def _tui_need_npm_install(root: Path) -> bool:
     ``node_modules/`` live at the workspace root (the parent of the
     ``ui-tui/`` directory).  The lockfile / ink / marker checks use that
     workspace root; only the prebuilt-bundle sentinel stays relative to
-    *root* (``ui-tui/dist/entry.js``).
+    *root* (``ui-tui/dist/entry.js``).  In that workspace-scoped mode, only
+    packages reachable from the ui-tui workspace are required; missing
+    desktop/web workspace packages are expected because launch-time install
+    intentionally runs ``npm install --workspace ui-tui``.
 
     Compares ``package-lock.json`` against ``node_modules/.package-lock.json``
     (npm's hidden lockfile) by **content**, not mtime: git checkouts and npm
@@ -1721,11 +1783,16 @@ def _tui_need_npm_install(root: Path) -> bool:
     def comparable(pkg: dict) -> dict:
         return {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
 
+    relevant_names = _workspace_scoped_lock_names(root, ws_root, wanted, installed)
+
     for name, pkg in wanted.items():
         if not name:
             continue
 
         if not isinstance(pkg, dict):
+            continue
+
+        if relevant_names is not None and name not in relevant_names:
             continue
 
         if name not in installed:
