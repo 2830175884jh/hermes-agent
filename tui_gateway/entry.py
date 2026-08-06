@@ -472,9 +472,8 @@ def main():
         except OSError as _stdin_exc:
             # Windows: a child process inheriting the stdio pipe can corrupt
             # its state, surfacing as EINVAL/EBADF/EPIPE on the next read
-            # instead of the empty-read that POSIX produces.  Retry
-            # (rate-limited) instead of crashing the gateway child and
-            # losing the in-flight session (#78820).
+            # instead of the empty-read that POSIX produces. EINVAL gets a
+            # rate-limited retry; closed/broken pipes exit for parent restart.
             _action = handle_stdin_oserror(_stdin_exc, _recovery_times, _log_exit)
             if _action is None:
                 raise

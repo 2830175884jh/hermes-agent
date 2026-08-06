@@ -164,15 +164,10 @@ def handle_spurious_eof(
 # produces.  Without a guard the exception propagates out of the read loop
 # and kills the gateway child mid-session, losing the in-flight turn.
 #
-# The recoverable errno set is deliberately narrow: only transient
-# pipe-corruption errors that a retry can clear.  Anything else
-# (ECONNRESET, ENOTCONN, permission errors, …) must propagate unchanged.
-
-_RECOVERABLE_STDIN_ERRNOS: frozenset[int] = frozenset({
-    errno.EINVAL,  # corrupted pipe state (primary Windows symptom)
-    errno.EBADF,   # child closed the inherited handle
-    errno.EPIPE,   # broken pipe on the read path
-})
+# Only EINVAL is transient. EBADF/EPIPE mean the command pipe can no longer
+# carry requests, so retrying would only spin until the rate limit is reached.
+_IS_WINDOWS = os.name == "nt"
+_CLOSED_STDIN_ERRNOS: frozenset[int] = frozenset({errno.EBADF, errno.EPIPE})
 
 
 def handle_stdin_oserror(
@@ -186,9 +181,9 @@ def handle_stdin_oserror(
 
     * ``True``  — the error is recoverable and under the rate limit; the
       caller should retry the read (``continue`` the loop).
-    * ``False`` — the error is recoverable but the rate limit was exceeded;
-      the caller should exit gracefully (``break``) so the parent respawns
-      with fresh state.
+    * ``False`` — stdin is closed/broken, or the EINVAL recovery rate limit
+      was exceeded; the caller should exit gracefully (``break``) so the
+      parent respawns with fresh state.
     * ``None``  — the error is **not** recoverable; the caller should
       re-raise so unexpected failures surface normally.
 
@@ -198,11 +193,21 @@ def handle_stdin_oserror(
     ``log_fn`` is called with a diagnostic string — ``_log_exit`` in
     ``entry.py``, a stderr ``print`` in ``slash_worker.py``.
     """
-    if exc.errno not in _RECOVERABLE_STDIN_ERRNOS:
+    if not _IS_WINDOWS:
         return None
 
-    # Mirror handle_spurious_eof's rate-limiting so the two recovery
-    # paths cannot gang up to create a busy-loop.
+    if exc.errno in _CLOSED_STDIN_ERRNOS:
+        log_fn(  # type: ignore[operator]
+            f"stdin pipe closed (errno={exc.errno}, {os.strerror(exc.errno)}), "
+            "exiting for parent restart"
+        )
+        return False
+
+    if exc.errno != errno.EINVAL:
+        return None
+
+    # Mirror handle_spurious_eof's rate-limiting so the two recovery paths
+    # share one budget and cannot gang up to create a busy-loop.
     now = time.time()
     recovery_times.append(now)
     recovery_times[:] = [t for t in recovery_times if t > now - 60]

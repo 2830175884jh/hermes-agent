@@ -16,6 +16,7 @@ import time
 
 import pytest
 
+import tui_gateway._stdin_recovery as stdin_recovery
 from tui_gateway._stdin_recovery import (
     MAX_RECOVERIES_PER_MINUTE,
     handle_stdin_oserror,
@@ -25,6 +26,12 @@ from tui_gateway._stdin_recovery import (
 # ---------------------------------------------------------------------------
 # Unit tests for handle_stdin_oserror (real production function)
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _windows_recovery_path(monkeypatch):
+    monkeypatch.setattr(stdin_recovery, "_IS_WINDOWS", True)
+
 
 class TestHandleStdinOserror:
     """Exercise every branch of the OSError recovery function."""
@@ -42,15 +49,29 @@ class TestHandleStdinOserror:
         assert handle_stdin_oserror(exc, times, lambda r: None) is True
         assert len(times) == 1
 
-    def test_ebadf_recoverable(self):
-        """EBADF (child closed inherited handle) is also recoverable."""
+    def test_ebadf_exits_without_retry(self):
+        """EBADF means the inherited pipe is closed and cannot be retried."""
         exc = OSError(errno.EBADF, os.strerror(errno.EBADF))
-        assert handle_stdin_oserror(exc, [], lambda r: None) is True
+        times: list[float] = []
+        messages: list[str] = []
+        assert handle_stdin_oserror(exc, times, messages.append) is False
+        assert times == []
+        assert any("closed" in message.lower() for message in messages)
 
-    def test_epipe_recoverable(self):
-        """EPIPE on a read path is recoverable on Windows."""
+    def test_epipe_exits_without_retry(self):
+        """EPIPE is terminal for this process; the parent must recreate it."""
         exc = OSError(errno.EPIPE, os.strerror(errno.EPIPE))
-        assert handle_stdin_oserror(exc, [], lambda r: None) is True
+        times: list[float] = []
+        messages: list[str] = []
+        assert handle_stdin_oserror(exc, times, messages.append) is False
+        assert times == []
+        assert any("closed" in message.lower() for message in messages)
+
+    def test_non_windows_einval_returns_none(self, monkeypatch):
+        """POSIX errors retain their existing propagation semantics."""
+        monkeypatch.setattr(stdin_recovery, "_IS_WINDOWS", False)
+        exc = OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+        assert handle_stdin_oserror(exc, [], lambda r: None) is None
 
     def test_rate_limit_exceeded_returns_false(self):
         """More than MAX_RECOVERIES_PER_MINUTE recoveries → graceful break."""
