@@ -1699,7 +1699,8 @@ def _workspace_scoped_lock_names(
 
     queue = list(relevant)
     while queue:
-        pkg = wanted.get(queue.pop(0))
+        package_name = queue.pop(0)
+        pkg = wanted.get(package_name)
         if not isinstance(pkg, dict):
             continue
         for field in _NPM_LOCK_DEP_FIELDS:
@@ -1707,7 +1708,17 @@ def _workspace_scoped_lock_names(
             if not isinstance(deps, dict):
                 continue
             for dep_name in deps:
-                dep_key = f"node_modules/{dep_name}"
+                package_path = Path(package_name)
+                dep_key = next(
+                    (
+                        (parent / "node_modules" / dep_name).as_posix()
+                        for parent in (package_path, *package_path.parents)
+                        if (parent / "node_modules" / dep_name).as_posix() in wanted
+                    ),
+                    None,
+                )
+                if dep_key is None:
+                    continue
                 if dep_key in wanted and dep_key not in relevant:
                     relevant.add(dep_key)
                     queue.append(dep_key)

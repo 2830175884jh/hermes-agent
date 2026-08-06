@@ -97,6 +97,46 @@ def test_workspace_detects_relevant_version_drift_even_with_current_bundle(
     assert main_mod._tui_need_npm_install(tui_dir) is True
 
 
+def test_workspace_resolves_nested_dependency_without_requiring_other_version(
+    tmp_path: Path, main_mod
+) -> None:
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}", encoding="utf-8")
+    _touch_ink(tmp_path)
+    wanted = {
+        "": {},
+        "ui-tui": {
+            "name": "hermes-tui",
+            "dependencies": {"strip-ansi": "7.2.0"},
+        },
+        "node_modules/strip-ansi": {
+            "version": "7.2.0",
+            "dependencies": {"ansi-regex": "6.2.2"},
+        },
+        # Another workspace needs v5 at the root; it is intentionally absent
+        # from a TUI-scoped install and must not be mistaken for strip-ansi's
+        # nested v6 dependency.
+        "node_modules/ansi-regex": {"version": "5.0.1"},
+        "node_modules/strip-ansi/node_modules/ansi-regex": {"version": "6.2.2"},
+        "web": {"dependencies": {"ansi-regex": "5.0.1"}},
+    }
+    installed = {
+        name: pkg.copy()
+        for name, pkg in wanted.items()
+        if name
+        in {
+            "ui-tui",
+            "node_modules/strip-ansi",
+            "node_modules/strip-ansi/node_modules/ansi-regex",
+        }
+    }
+    _write_lock(tmp_path / "package-lock.json", wanted)
+    _write_lock(tmp_path / "node_modules" / ".package-lock.json", installed)
+
+    assert main_mod._tui_need_npm_install(tui_dir) is False
+
+
 def test_standalone_layout_compares_full_lockfile(tmp_path: Path, main_mod) -> None:
     tui_dir = tmp_path / "ui-tui"
     tui_dir.mkdir()
